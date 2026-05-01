@@ -29,7 +29,7 @@
 	"kv_namespaces": [
 		{
 			"binding": "OAUTH_KV",
-			"id": "<Add-KV-ID>"
+			"id": "ca4de382e7bc47dab994ca4f776a0b03"
 		}
 	],
 	"ai": {
