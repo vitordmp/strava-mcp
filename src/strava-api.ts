@@ -421,6 +421,142 @@ export class StravaClient {
   async getSegmentEffortStreams(id: number, keys: string[]): Promise<any> {
     return this.request(`/segment_efforts/${id}/streams?keys=${keys.join(',')}`);
   }
+
+  // Analysis helpers
+  /**
+   * Pulls activity zones + HR stream + activity meta and computes a training-context
+   * summary. Designed for runners/lifters tracking VO2 Max work, Zone 2 verification,
+   * and density sessions.
+   */
+  async analyzeZoneDistribution(activityId: number): Promise<ZoneAnalysisResult> {
+    // Fetch in parallel — these are independent endpoints.
+    const [activity, zones, streams] = await Promise.all([
+      this.getActivity(activityId),
+      this.getActivityZones(activityId).catch(() => [] as ActivityZone[]),
+      this.getActivityStreams(activityId, ['heartrate', 'time']).catch(() => null),
+    ]);
+
+    const hrZone = zones.find((z) => z.type === 'heartrate');
+    const buckets: Array<{ min: number; max: number; time: number }> = hrZone?.distribution_buckets ?? [];
+
+    const totalSeconds = buckets.reduce((sum, b) => sum + (b.time ?? 0), 0);
+
+    const zoneBreakdown = buckets.map((b, i) => {
+      const zoneNumber = i + 1;
+      const seconds = b.time ?? 0;
+      const minutes = seconds / 60;
+      const pct = totalSeconds > 0 ? (seconds / totalSeconds) * 100 : 0;
+      return {
+        zone: zoneNumber,
+        bpm_range: { min: b.min, max: b.max < 0 ? null : b.max },
+        seconds,
+        minutes: Math.round(minutes * 10) / 10,
+        pct_of_activity: Math.round(pct * 10) / 10,
+      };
+    });
+
+    // Stream-derived stats (can give finer-grained HR analysis than the bucketed zones)
+    let hrStats: { avg: number; max: number; samples: number } | null = null;
+    if (streams && Array.isArray(streams.heartrate?.data)) {
+      const hr: number[] = streams.heartrate.data;
+      if (hr.length > 0) {
+        const sum = hr.reduce((s, v) => s + v, 0);
+        hrStats = {
+          avg: Math.round(sum / hr.length),
+          max: Math.max(...hr),
+          samples: hr.length,
+        };
+      }
+    }
+
+    // Interpretation aimed at the training contexts most relevant to runners + KB/density work
+    const z2 = zoneBreakdown.find((z) => z.zone === 2);
+    const z4 = zoneBreakdown.find((z) => z.zone === 4);
+    const z5 = zoneBreakdown.find((z) => z.zone === 5);
+
+    const minutesAtOrAboveZ4 = (z4?.minutes ?? 0) + (z5?.minutes ?? 0);
+
+    const session_character = (() => {
+      if (!totalSeconds) return 'unknown';
+      const z2pct = z2?.pct_of_activity ?? 0;
+      const z45min = minutesAtOrAboveZ4;
+      if (z2pct >= 70) return 'zone_2_dominant';
+      if (z45min >= 8) return 'high_intensity_vo2_stimulus';
+      if ((z4?.minutes ?? 0) >= 4) return 'threshold_work';
+      const z3pct = zoneBreakdown.find((z) => z.zone === 3)?.pct_of_activity ?? 0;
+      if (z3pct >= 50) return 'tempo_or_grey_zone';
+      return 'mixed';
+    })();
+
+    return {
+      activity_id: activityId,
+      activity_name: activity?.name ?? null,
+      activity_type: activity?.sport_type ?? activity?.type ?? null,
+      start_date: activity?.start_date ?? null,
+      duration_minutes: activity?.elapsed_time ? Math.round(activity.elapsed_time / 60) : null,
+      distance_km: activity?.distance ? Math.round((activity.distance / 1000) * 100) / 100 : null,
+      hr_stats: hrStats,
+      zone_breakdown: zoneBreakdown,
+      total_zone_minutes: Math.round((totalSeconds / 60) * 10) / 10,
+      vo2_stimulus_minutes: Math.round(minutesAtOrAboveZ4 * 10) / 10,
+      session_character,
+      sensor_based: hrZone?.sensor_based ?? false,
+      notes: buildAnalysisNotes(session_character, minutesAtOrAboveZ4, z2?.pct_of_activity ?? 0),
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Analysis types + helpers
+// ─────────────────────────────────────────────────────────────
+
+export interface ZoneAnalysisResult {
+  activity_id: number;
+  activity_name: string | null;
+  activity_type: string | null;
+  start_date: string | null;
+  duration_minutes: number | null;
+  distance_km: number | null;
+  hr_stats: { avg: number; max: number; samples: number } | null;
+  zone_breakdown: Array<{
+    zone: number;
+    bpm_range: { min: number; max: number | null };
+    seconds: number;
+    minutes: number;
+    pct_of_activity: number;
+  }>;
+  total_zone_minutes: number;
+  vo2_stimulus_minutes: number;
+  session_character:
+    | 'zone_2_dominant'
+    | 'tempo_or_grey_zone'
+    | 'threshold_work'
+    | 'high_intensity_vo2_stimulus'
+    | 'mixed'
+    | 'unknown';
+  sensor_based: boolean;
+  notes: string;
+}
+
+function buildAnalysisNotes(
+  character: ZoneAnalysisResult['session_character'],
+  vo2Minutes: number,
+  z2Pct: number,
+): string {
+  switch (character) {
+    case 'zone_2_dominant':
+      return `Z2 made up ${z2Pct.toFixed(0)}% of the session — solid aerobic base work. Mitochondrial / fat-ox stimulus, low recovery cost.`;
+    case 'high_intensity_vo2_stimulus':
+      return `${vo2Minutes.toFixed(1)} minutes at Z4+ — meaningful VO2 Max stimulus. The classic guidance is ~8-15 min total at or above Z4 per session for VO2 adaptation.`;
+    case 'threshold_work':
+      return `Concentrated time at Z4 — threshold/lactate work. Useful for sustained pace, less specific to raising VO2 Max ceiling.`;
+    case 'tempo_or_grey_zone':
+      return `Bulk of the session sat in Z3 — tempo / grey zone. Adds fatigue without strong VO2 Max signal; often better split into Z2 + Z4-5.`;
+    case 'mixed':
+      return `Distribution across multiple zones with no single dominant intensity. Common for fartleks, BJJ rounds, or interval-style density work.`;
+    default:
+      return `Insufficient zone data to characterize the session.`;
+  }
 }
 
 // Example usage:

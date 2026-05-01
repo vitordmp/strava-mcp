@@ -208,6 +208,23 @@ export class StravaMCP extends McpAgent<unknown, unknown, Props> {
 		);
 
 		this.server.tool(
+			"analyzeZoneDistribution",
+			"Analyze HR zone distribution for an activity. Returns time-in-zone breakdown, VO2 Max stimulus minutes (time at Z4+), Zone 2 percentage, and an interpretation of the session's training character (zone_2_dominant, threshold_work, high_intensity_vo2_stimulus, tempo_or_grey_zone, mixed). Useful for verifying whether a run was actually Z2 or whether an interval session delivered enough Z4+ time for VO2 adaptation.",
+			{
+				id: z.number({ description: "Activity ID" }),
+			},
+			async ({ id }) => {
+				const analysis = await new StravaClient(this.props.accessToken).analyzeZoneDistribution(id);
+				return {
+					content: [{
+						type: "text",
+						text: JSON.stringify(analysis, null, 2),
+					}],
+				};
+			},
+		);
+
+		this.server.tool(
 			"getActivityLaps",
 			"Get laps for a specific activity",
 			{
