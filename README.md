@@ -1,144 +1,91 @@
-# Model Context Protocol (MCP) Server + Strava OAuth
+# Strava MCP
 
-This is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server that supports remote MCP connections, with Strava OAuth built-in. It allows users to connect to your MCP server by signing in with their Strava account.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that exposes Strava data to Claude via Cloudflare Workers + OAuth 2.1.
 
-## Overview
+Forked from [kw510/strava-mcp](https://github.com/kw510/strava-mcp) with one addition: an `analyzeZoneDistribution` tool aimed at training-context analysis (Zone 2 verification, VO2 Max stimulus tracking, session character classification).
 
-The MCP server (powered by [Cloudflare Workers](https://developers.cloudflare.com/workers/)) serves two roles:
-- Acts as an OAuth Server for your MCP clients
-- Acts as an OAuth Client for Strava's OAuth services
+## What it does
 
-This project serves as a reference example for integrating OAuth providers with an MCP server deployed to Cloudflare, using the [`workers-oauth-provider` library](https://github.com/cloudflare/workers-oauth-provider).
+- Exposes 38+ Strava API endpoints as MCP tools (activities, segments, routes, clubs, athlete data, streams, zones)
+- Handles OAuth 2.1 end-to-end — connect once via the Claude.ai connector UI, no token copy/paste
+- Runs on Cloudflare Workers free tier (well under the 100k req/day limit for personal use)
 
-## Prerequisites
+## Tools added in this fork
 
-- A Strava account
-- A Cloudflare account
-- Node.js and npm installed
-- Wrangler CLI installed (`npm install -g wrangler`)
+### `analyzeZoneDistribution`
 
-## Quick Start
+Takes an activity ID. Pulls activity zones, HR streams, and activity metadata in parallel, then computes:
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/kw510/strava-mcp.git
-   cd strava-mcp
-   npm install
-   ```
+- **Time-in-zone breakdown** with bpm ranges, minutes, and percentages
+- **VO2 stimulus minutes** — total time at Z4 + Z5 (the standard ~8–15 min/session target for VO2 Max adaptation)
+- **Z2 percentage** — for verifying whether an "easy run" was actually easy
+- **Session character classification**: `zone_2_dominant` / `threshold_work` / `high_intensity_vo2_stimulus` / `tempo_or_grey_zone` / `mixed`
+- **HR stats** from the second-by-second stream (avg, max, sample count)
+- **Plain-language interpretation** in the `notes` field
 
-2. Set up your Strava API credentials (see [Setting Up Strava API Credentials](#setting-up-strava-api-credentials))
+This is the layer the upstream repo doesn't have — it provides interpreted output rather than raw zone JSON.
 
-3. Set up your Cloudflare KV namespace:
-   ```bash
-   wrangler kv:namespace create "OAUTH_KV"
-   ```
-   Update the `wrangler.toml` file with the generated KV ID.
+## Deploy
 
-4. Deploy to Cloudflare:
-   ```bash
-   wrangler deploy
-   ```
+### 1. Strava API credentials
 
-## Setting Up Strava API Credentials
+1. Go to <https://www.strava.com/settings/api>
+2. Create an application:
+   - **Authorization Callback Domain**: `strava-mcp.<your-cloudflare-subdomain>.workers.dev`
+   - **Authorization Callback URL**: `https://strava-mcp.<your-cloudflare-subdomain>.workers.dev/callback`
+3. Note your **Client ID** and **Client Secret**
 
-### For Production
-1. Go to [Strava's API Settings](https://www.strava.com/settings/api) and create a new application
-2. Configure your application:
-   - Application Name: Choose a name for your application
-   - Category: Select an appropriate category
-   - Website: Your website URL
-   - Application Description: Brief description of your application
-   - Authorization Callback Domain: `mcp-strava-oauth.<your-subdomain>.workers.dev`
-   - Authorization Callback URL: `https://mcp-strava-oauth.<your-subdomain>.workers.dev/callback`
+### 2. Cloudflare deployment
 
-3. Set your production environment variables:
-   ```bash
-   wrangler secret put STRAVA_CLIENT_ID
-   wrangler secret put STRAVA_CLIENT_SECRET
-   ```
+```bash
+git clone https://github.com/<your-username>/strava-mcp.git
+cd strava-mcp
+npm install
 
-### For Development
-1. Create a separate Strava API application for development
-2. Configure your development application:
-   - Authorization Callback Domain: `localhost`
-   - Authorization Callback URL: `http://localhost:8788/callback`
+# Create the OAuth KV namespace
+npx wrangler kv namespace create OAUTH_KV
+# Copy the returned ID into wrangler.jsonc → kv_namespaces[0].id
 
-3. Create a `.dev.vars` file in your project root:
-   ```
-   STRAVA_CLIENT_ID=your_development_strava_client_id
-   STRAVA_CLIENT_SECRET=your_development_strava_client_secret
-   ```
+# Push your secrets
+npx wrangler secret put STRAVA_CLIENT_ID
+npx wrangler secret put STRAVA_CLIENT_SECRET
 
-## Testing Your MCP Server
+# Deploy
+npx wrangler deploy
+```
 
-### Using Inspector
-1. Install the Inspector tool:
-   ```bash
-   npx @modelcontextprotocol/inspector@latest
-   ```
+Wrangler will print the public URL. Use that as your callback domain in step 1 (you may need to update the Strava app after the first deploy if you didn't know the subdomain yet).
 
-2. Connect to your server:
-   - For production: `https://mcp-strava-oauth.<your-subdomain>.workers.dev/sse`
-   - For development: `http://localhost:8788/sse`
+### 3. Connect to Claude
 
-### Using Claude Desktop
-1. Open Claude Desktop and go to Settings -> Developer -> Edit Config
-2. Add your MCP server configuration:
-   ```json
-   {
-     "mcpServers": {
-       "strava": {
-         "command": "npx",
-         "args": [
-           "mcp-remote",
-           "https://mcp-strava-oauth.<your-subdomain>.workers.dev/sse"
-         ]
-       }
-     }
-   }
-   ```
-3. Restart Claude Desktop and complete the OAuth flow
+In Claude → Settings → Connectors → Add custom connector:
 
-## Development
+- **URL**: `https://strava-mcp.<your-subdomain>.workers.dev/sse`
 
-### Local Development
-1. Start the development server:
-   ```bash
-   wrangler dev
-   ```
+Claude opens the Strava OAuth flow in a popup. Authorize, and the tools become available.
 
-2. The server will be available at `http://localhost:8788`
+## Local dev
 
-### API Rate Limits
-The Strava API has the following rate limits:
-- 200 requests every 15 minutes
-- 2,000 requests per day
+```bash
+# Create a separate Strava app with localhost callbacks for development
+# Authorization Callback Domain: localhost
+# Authorization Callback URL: http://localhost:8788/callback
 
-## How It Works
+# Put dev credentials in .dev.vars
+echo "STRAVA_CLIENT_ID=..." > .dev.vars
+echo "STRAVA_CLIENT_SECRET=..." >> .dev.vars
 
-### OAuth Provider
-The OAuth Provider library handles:
-- OAuth 2.1 server implementation
-- Token issuance and validation
-- Secure token storage in KV
-- Strava OAuth integration
+npx wrangler dev
+# Server runs at http://localhost:8788
+```
 
-### Durable MCP
-Provides:
-- Persistent state management
-- Secure authentication context storage
-- User information access via `this.props`
-- Conditional tool availability
+## Strava API rate limits
 
-### MCP Remote
-Enables:
-- Client-server communication
-- Tool definition and management
-- Request/response serialization
-- SSE connection maintenance
+- 200 requests / 15 min
+- 2,000 requests / day
 
-## Troubleshooting
+Plenty for personal use. The `analyzeZoneDistribution` tool issues 3 parallel requests per call (activity, zones, streams).
 
-- If you see error messages in Claude Desktop, verify the connection by hovering over the 🔨 icon
-- For Cursor integration, use the "Command" type and combine command and args into one string
-- Ensure your callback URLs match exactly with what's configured in your Strava application
+## License
+
+MIT, inherited from the upstream repo.
